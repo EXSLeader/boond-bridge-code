@@ -1,0 +1,3 @@
+{
+  "functions": { "api/open_missions.py": { "runtime": "python3.11" } }
+}
