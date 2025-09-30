@@ -2,7 +2,7 @@ import os
 import json
 from http import HTTPStatus
 import requests
-from pyboondmanager.auth import generate_jwt  # builds X-Jwt-Client
+from boondmanager.auth import get_jwt  # builds X-Jwt-Client
 
 # Secrets (these will come from Vercel Environment Variables, not hardcoded)
 USER_TOKEN   = os.environ["BOOND_USER_TOKEN"]
@@ -17,7 +17,7 @@ API_BASES = [
 
 def fetch_missions():
     """Fetch active missions/projects from Boond."""
-    jwt = generate_jwt(USER_TOKEN, CLIENT_TOKEN, CLIENT_KEY)
+    jwt = get_jwt(USER_TOKEN, CLIENT_TOKEN, CLIENT_KEY)
     headers = {"X-Jwt-Client": jwt, "Content-Type": "application/json"}
 
     # Try different endpoints (tenant versions differ)
