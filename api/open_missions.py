@@ -1,94 +1,80 @@
 # api/open_missions.py
-import os
-import time
-import json
-import jwt
-import requests
+import os, json, time
 from http import HTTPStatus
+import requests
+import jwt  # PyJWT
+from werkzeug.wrappers import Request, Response
 
-# --- Env (set in Vercel > Project > Settings > Environment Variables) ---
+# ---- Environment
+BASE_URL     = os.environ["BOOND_BASE_URL"].rstrip("/")   # e.g. https://ui.boondmanager.com/api
 USER_TOKEN   = os.environ["BOOND_USER_TOKEN"]
 CLIENT_TOKEN = os.environ["BOOND_CLIENT_TOKEN"]
 CLIENT_KEY   = os.environ["BOOND_CLIENT_KEY"]
-GATEKEEPER   = os.environ["GATEKEEPER_TOKEN"]     # your shared secret
+GATEKEEPER   = os.environ["GATEKEEPER_TOKEN"]
 
-# --- Auth helper (X-Jwt-Client-Boondmanager) ---
-def generate_jwt(user_token: str, client_token: str, client_key: str) -> str:
+def build_xjwt(user_token: str, client_token: str, client_key: str) -> str:
     now = int(time.time())
     payload = {
+        "userToken": user_token,
+        "clientToken": client_token,
         "iat": now,
-        "exp": now + 60,           # short lived, like the app does
-        "user_token": user_token,
-        "client_token": client_token,
+        "exp": now + 300,  # valid 5 minutes
     }
     return jwt.encode(payload, client_key, algorithm="HS256")
 
-# --- Call Boond: opportunities (kanban “open”) ---
 def fetch_opportunities():
-    """
-    Mirrors the request you saw in Chrome DevTools:
-    GET /api/opportunities?...&opportunityStates=6&viewMode=kanban
-    """
-    token = generate_jwt(USER_TOKEN, CLIENT_TOKEN, CLIENT_KEY)
-
+    token = build_xjwt(USER_TOKEN, CLIENT_TOKEN, CLIENT_KEY)
     headers = {
         "X-Jwt-Client-Boondmanager": token,
         "Accept": "application/vnd.api+json",
         "Content-Type": "application/json",
+        # helpful UI-like headers (optional)
+        "X-Front-Boondmanager": "ember",
+        "X-Front-Version": "9.0.4.0",
     }
 
-    url = "https://ui.boondmanager.com/api/opportunities"
+    # minimal working query copied from your DevTools
     params = {
-        "activityAreas": "",
-        "expertiseAreas": "",
         "maxResults": "30",
-        "opportunityStates": "6",   # 6 = “open” in kanban
-        "opportunityTypes": "",
         "order": "desc",
         "page": "1",
-        "positioningStates": "",
-        "returnMoreData": "previousAction,nextAction",
         "saveSearch": "true",
         "sort": "updateDate",
-        "tools": "",
-        "viewMode": "kanban",
+        "opportunityStates": "6",
+        "returnMoreData": "previousAction,nextAction",
     }
 
-    r = requests.get(url, headers=headers, params=params, timeout=30)
-
-    if r.status_code != 200:
-        return {
-            "error": "fetch_opportunities_failed",
-            "status": r.status_code,
-            "preview": r.text[:800],
-        }
-
-    return r.json()
-
-# --- Vercel entrypoint (WSGI) with gatekeeper ---
-def app(environ, start_response):
-    from urllib.parse import parse_qs
-    path = environ.get("PATH_INFO", "")
-    qs = parse_qs(environ.get("QUERY_STRING", ""))
-
-    def respond(status: int, body: dict, ctype="application/json"):
-        payload = json.dumps(body).encode("utf-8")
-        start_response(
-            f"{status} {HTTPStatus(status).phrase}",
-            [("Content-Type", ctype), ("Content-Length", str(len(payload)))],
-        )
-        return [payload]
-
-    if path.rstrip("/") != "/api/open_missions":
-        return respond(404, {"error": "not_found"})
-
-    # simple shared-secret to avoid random hits
-    token = (qs.get("token", [""])[0]).strip()
-    if token != GATEKEEPER:
-        return respond(401, {"error": "unauthorized"})
-
+    attempts = []
+    url = f"{BASE_URL}/opportunities"
     try:
-        data = fetch_opportunities()
-        return respond(200, data)
+        r = requests.get(url, headers=headers, params=params, timeout=30)
+        attempts.append({"url": r.url, "status": r.status_code, "ok": r.ok})
+        if r.ok:
+            return r.json()
     except Exception as e:
-        return respond(500, {"error": "server_error", "detail": str(e)})
+        attempts.append({"url": url, "error": str(e)})
+
+    # fallback to projects just for debugging visibility
+    try:
+        alt = f"{BASE_URL}/projects"
+        r2 = requests.get(alt, headers=headers, timeout=30)
+        attempts.append({"url": r2.url, "status": r2.status_code, "ok": r2.ok})
+        if r2.ok:
+            return r2.json()
+    except Exception as e:
+        attempts.append({"url": f'{BASE_URL}/projects', "error": str(e)})
+
+    return {"error": "No endpoint matched", "attempts": attempts}
+
+def app(environ, start_response):
+    req = Request(environ)
+    if req.path.endswith("/api/open_missions"):
+        token = req.args.get("token", "")
+        if token != GATEKEEPER:
+            resp = Response("Unauthorized", HTTPStatus.UNAUTHORIZED, {"Content-Type": "text/plain"})
+        else:
+            data = fetch_opportunities()
+            resp = Response(json.dumps(data), 200, {"Content-Type": "application/json"})
+    else:
+        resp = Response("Not found", 404, {"Content-Type": "text/plain"})
+    return resp(environ, start_response)
