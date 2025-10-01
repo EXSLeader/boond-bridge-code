@@ -1,106 +1,94 @@
 # api/open_missions.py
-import os, json
-from http import HTTPStatus
+import os
+import time
+import json
+import jwt
 import requests
-from werkzeug.wrappers import Request, Response
+from http import HTTPStatus
 
-# ---- Secrets / Config (from Vercel env) ----
-USER_TOKEN    = os.environ["BOOND_USER_TOKEN"]
-CLIENT_TOKEN  = os.environ["BOOND_CLIENT_TOKEN"]
-CLIENT_KEY    = os.environ["BOOND_CLIENT_KEY"]
-GATEKEEPER    = os.environ["GATEKEEPER_TOKEN"]
-BASE_URL      = os.environ.get("BOOND_BASE_URL", "https://ui.boondmanager.com/api").rstrip("/")
+# --- Env (set in Vercel > Project > Settings > Environment Variables) ---
+USER_TOKEN   = os.environ["BOOND_USER_TOKEN"]
+CLIENT_TOKEN = os.environ["BOOND_CLIENT_TOKEN"]
+CLIENT_KEY   = os.environ["BOOND_CLIENT_KEY"]
+GATEKEEPER   = os.environ["GATEKEEPER_TOKEN"]     # your shared secret
 
-def _get_jwt():
+# --- Auth helper (X-Jwt-Client-Boondmanager) ---
+def generate_jwt(user_token: str, client_token: str, client_key: str) -> str:
+    now = int(time.time())
+    payload = {
+        "iat": now,
+        "exp": now + 60,           # short lived, like the app does
+        "user_token": user_token,
+        "client_token": client_token,
+    }
+    return jwt.encode(payload, client_key, algorithm="HS256")
+
+# --- Call Boond: opportunities (kanban “open”) ---
+def fetch_opportunities():
     """
-    Your tenant already accepts X-Jwt-Client* headers (we saw 200s).
-    We reuse the same header form. If Boond later requires a signed token,
-    this function can be swapped for a real signer.
+    Mirrors the request you saw in Chrome DevTools:
+    GET /api/opportunities?...&opportunityStates=6&viewMode=kanban
     """
-    return f"{USER_TOKEN}:{CLIENT_TOKEN}:{CLIENT_KEY}"
+    token = generate_jwt(USER_TOKEN, CLIENT_TOKEN, CLIENT_KEY)
 
-def _headers():
-    return {
-        "Accept": "application/json",
+    headers = {
+        "X-Jwt-Client-Boondmanager": token,
+        "Accept": "application/vnd.api+json",
         "Content-Type": "application/json",
-        "X-Front-Boondmanager": "ember",
-        "X-Jwt-Client-Boondmanager": _get_jwt()
     }
 
-# ---------- Flatteners ----------
-def _index_included(included):
-    by_type = {}
-    for inc in included or []:
-        by_type.setdefault(inc.get("type"), {})[inc.get("id")] = inc
-    return by_type
+    url = "https://ui.boondmanager.com/api/opportunities"
+    params = {
+        "activityAreas": "",
+        "expertiseAreas": "",
+        "maxResults": "30",
+        "opportunityStates": "6",   # 6 = “open” in kanban
+        "opportunityTypes": "",
+        "order": "desc",
+        "page": "1",
+        "positioningStates": "",
+        "returnMoreData": "previousAction,nextAction",
+        "saveSearch": "true",
+        "sort": "updateDate",
+        "tools": "",
+        "viewMode": "kanban",
+    }
 
-def _get_attr(obj, path, default=None):
-    cur = obj
-    for key in path:
-        if not isinstance(cur, dict): return default
-        cur = cur.get(key)
-        if cur is None: return default
-    return cur
+    r = requests.get(url, headers=headers, params=params, timeout=30)
 
-def _flatten_opportunities(opps_json):
-    """
-    Normalize Boond 'opportunities' into a compact, match-ready list.
-    We try to extract: id, title, company name, optional start/end/status.
-    """
-    data = opps_json.get("data", [])
-    included = opps_json.get("included", [])
-    by_type = _index_included(included)
+    if r.status_code != 200:
+        return {
+            "error": "fetch_opportunities_failed",
+            "status": r.status_code,
+            "preview": r.text[:800],
+        }
 
-    out = []
-    for opp in data:
-        attrs = opp.get("attributes", {}) or {}
-        rels  = opp.get("relationships", {}) or {}
+    return r.json()
 
-        # Company via relationships or included
-        comp_rel = _get_attr(rels, ["company", "data"])
-        company_name = None
-        if comp_rel:
-            comp_obj = by_type.get("company", {}).get(comp_rel.get("id"))
-            if comp_obj:
-                company_name = _get_attr(comp_obj, ["attributes", "name"])
-
-        out.append({
-            "opportunity_id": opp.get("id"),
-            "title": attrs.get("title"),
-            "company": company_name,
-            "start": attrs.get("startDate") or attrs.get("beginDate") or attrs.get("start_date"),
-            "end": attrs.get("endDate") or attrs.get("dueDate") or attrs.get("end_date"),
-            "status": attrs.get("status") or attrs.get("state"),
-            "updated": attrs.get("updateDate") or attrs.get("updated_at"),
-        })
-    return out
-
-# ---------- Fetchers ----------
-def fetch_opportunities():
-    url = f"{BASE_URL}/opportunities"
-    r = requests.get(url, headers=_headers(), timeout=30)
-    if r.status_code == 200:
-        return {"opportunities": _flatten_opportunities(r.json())}
-    return {"error": f"Boond returned {r.status_code}", "body": r.text[:500]}
-
-# ---------- Vercel Entrypoint ----------
+# --- Vercel entrypoint (WSGI) with gatekeeper ---
 def app(environ, start_response):
-    req = Request(environ)
-    if req.path.endswith("/api/open_missions"):
-        token = req.args.get("token", "")
-        if token != GATEKEEPER:
-            resp = Response("Unauthorized", HTTPStatus.UNAUTHORIZED, {"Content-Type": "text/plain"})
-        else:
-            debug = req.args.get("debug") == "1"
-            if debug:
-                probe = requests.get(f"{BASE_URL}/opportunities", headers=_headers(), timeout=30)
-                payload = {
-                    "attempt": {"url": f"{BASE_URL}/opportunities", "status": probe.status_code},
-                    "preview": (_flatten_opportunities(probe.json())[:5] if probe.ok else None)
-                }
-            else:
-                payload = fetch_opportunities()
-            resp = Response(json.dumps(payload), 200, {"Content-Type": "application/json"})
-    else:
-        resp = Response("Not found", 404, {"Content-Type": "text/plain"})
-    return resp(environ, start_response)
+    from urllib.parse import parse_qs
+    path = environ.get("PATH_INFO", "")
+    qs = parse_qs(environ.get("QUERY_STRING", ""))
+
+    def respond(status: int, body: dict, ctype="application/json"):
+        payload = json.dumps(body).encode("utf-8")
+        start_response(
+            f"{status} {HTTPStatus(status).phrase}",
+            [("Content-Type", ctype), ("Content-Length", str(len(payload)))],
+        )
+        return [payload]
+
+    if path.rstrip("/") != "/api/open_missions":
+        return respond(404, {"error": "not_found"})
+
+    # simple shared-secret to avoid random hits
+    token = (qs.get("token", [""])[0]).strip()
+    if token != GATEKEEPER:
+        return respond(401, {"error": "unauthorized"})
+
+    try:
+        data = fetch_opportunities()
+        return respond(200, data)
+    except Exception as e:
+        return respond(500, {"error": "server_error", "detail": str(e)})
