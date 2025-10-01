@@ -33,14 +33,14 @@ def fetch_opportunities():
         "X-Front-Version": "9.0.4.0",
     }
 
-    # minimal working query copied from your DevTools
+    # default query (matches your DevTools capture: state=6, sorted by updateDate desc)
     params = {
         "maxResults": "30",
         "order": "desc",
         "page": "1",
         "saveSearch": "true",
         "sort": "updateDate",
-        "opportunityStates": "6",
+        "opportunityStates": "6",  # “À pourvoir” (adjust later if needed)
         "returnMoreData": "previousAction,nextAction",
     }
 
@@ -54,7 +54,7 @@ def fetch_opportunities():
     except Exception as e:
         attempts.append({"url": url, "error": str(e)})
 
-    # fallback to projects just for debugging visibility
+    # fallback to projects for debug visibility if opps fail
     try:
         alt = f"{BASE_URL}/projects"
         r2 = requests.get(alt, headers=headers, timeout=30)
