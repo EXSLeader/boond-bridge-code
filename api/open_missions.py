@@ -1,145 +1,106 @@
-import os
-import json
-import base64
+# api/open_missions.py
+import os, json
 from http import HTTPStatus
 import requests
+from werkzeug.wrappers import Request, Response
 
-# === Secrets depuis Vercel ===
-USER_TOKEN    = os.environ["BOOND_USER_TOKEN"]        # ex: 322e6578736f6c766165
-CLIENT_TOKEN  = os.environ.get("BOOND_CLIENT_TOKEN")  # ex: 6578736f6c766165
-CLIENT_KEY    = os.environ.get("BOOND_CLIENT_KEY")    # ex: 625af3a0380677306086
+# ---- Secrets / Config (from Vercel env) ----
+USER_TOKEN    = os.environ["BOOND_USER_TOKEN"]
+CLIENT_TOKEN  = os.environ["BOOND_CLIENT_TOKEN"]
+CLIENT_KEY    = os.environ["BOOND_CLIENT_KEY"]
 GATEKEEPER    = os.environ["GATEKEEPER_TOKEN"]
+BASE_URL      = os.environ.get("BOOND_BASE_URL", "https://ui.boondmanager.com/api").rstrip("/")
 
-# Base API: on utilise l'UI proxy (confirmé) + externe v2
-BASES = []
-env_base = os.environ.get("BOOND_BASE_URL", "").rstrip("/")
-if env_base:
-    BASES.append(env_base)
-# On s'assure d'avoir les 2 variantes courantes
-for b in ("https://ui.boondmanager.com/api/v2",
-          "https://ui.boondmanager.com/api/externe/v2"):
-    if b not in BASES:
-        BASES.append(b)
-
-# Endpoints candidats (relatifs au "base")
-CANDIDATES = [
-    ("/projects", None),
-    ("/missions", None),
-    ("/projectneeds", None),
-    ("/opportunities", None),
-    ("/projects/search", None),
-]
-
-def _basic_header(user: str, pwd: str) -> dict:
-    token = base64.b64encode(f"{user}:{pwd}".encode("utf-8")).decode("ascii")
-    return {"Authorization": f"Basic {token}"}
-
-def make_headers_variants():
+def _get_jwt():
     """
-    On teste plusieurs variantes BasicAuth, car selon la conf Boond :
-    - user = USER_TOKEN, password = CLIENT_KEY
-    - user = USER_TOKEN, password = CLIENT_TOKEN
-    - user = USER_TOKEN, password = "" (vide)
-    On garde aussi une variante 'X-Jwt-Client' au cas où.
+    Your tenant already accepts X-Jwt-Client* headers (we saw 200s).
+    We reuse the same header form. If Boond later requires a signed token,
+    this function can be swapped for a real signer.
     """
-    variants = []
+    return f"{USER_TOKEN}:{CLIENT_TOKEN}:{CLIENT_KEY}"
 
-    # Accept/Content par défaut
-    common = {
+def _headers():
+    return {
         "Accept": "application/json",
         "Content-Type": "application/json",
         "X-Front-Boondmanager": "ember",
+        "X-Jwt-Client-Boondmanager": _get_jwt()
     }
 
-    # BasicAuth variantes
-    if CLIENT_KEY:
-        h1 = common.copy()
-        h1.update(_basic_header(USER_TOKEN, CLIENT_KEY))
-        variants.append(h1)
+# ---------- Flatteners ----------
+def _index_included(included):
+    by_type = {}
+    for inc in included or []:
+        by_type.setdefault(inc.get("type"), {})[inc.get("id")] = inc
+    return by_type
 
-    if CLIENT_TOKEN:
-        h2 = common.copy()
-        h2.update(_basic_header(USER_TOKEN, CLIENT_TOKEN))
-        variants.append(h2)
+def _get_attr(obj, path, default=None):
+    cur = obj
+    for key in path:
+        if not isinstance(cur, dict): return default
+        cur = cur.get(key)
+        if cur is None: return default
+    return cur
 
-    # mot de passe vide
-    h3 = common.copy()
-    h3.update(_basic_header(USER_TOKEN, ""))
-    variants.append(h3)
+def _flatten_opportunities(opps_json):
+    """
+    Normalize Boond 'opportunities' into a compact, match-ready list.
+    We try to extract: id, title, company name, optional start/end/status.
+    """
+    data = opps_json.get("data", [])
+    included = opps_json.get("included", [])
+    by_type = _index_included(included)
 
-    # Variante JWT en secours si jamais BasicAuth n'est pas pris en compte
-    try:
-        from boondmanager.auth import get_jwt
-        jwt = get_jwt(USER_TOKEN, CLIENT_TOKEN or "", CLIENT_KEY or "")
-        h4 = common.copy()
-        h4["X-Jwt-Client-Boondmanager"] = jwt
-        variants.append(h4)
-        h5 = common.copy()
-        h5["X-Jwt-Client"] = jwt
-        variants.append(h5)
-    except Exception:
-        pass
+    out = []
+    for opp in data:
+        attrs = opp.get("attributes", {}) or {}
+        rels  = opp.get("relationships", {}) or {}
 
-    return variants
+        # Company via relationships or included
+        comp_rel = _get_attr(rels, ["company", "data"])
+        company_name = None
+        if comp_rel:
+            comp_obj = by_type.get("company", {}).get(comp_rel.get("id"))
+            if comp_obj:
+                company_name = _get_attr(comp_obj, ["attributes", "name"])
 
-def try_get(url, headers_list, params=None):
-    attempts = []
-    for headers in headers_list:
-        try:
-            r = requests.get(url, headers=headers, params=params, timeout=30)
-            attempts.append({
-                "url": url + (f"?{requests.compat.urlencode(params)}" if params else ""),
-                "status": r.status_code,
-                "ok": r.ok,
-                "len": len(r.text or ""),
-                "auth_hdr": [k for k in headers.keys() if k.lower().startswith("authorization") or k.lower().startswith("x-jwt")]
-            })
-            if r.status_code == 200:
-                # retourne du JSON ?
-                try:
-                    return r.json(), attempts
-                except Exception:
-                    continue
-        except Exception as e:
-            attempts.append({"url": url, "error": str(e)})
-    return None, attempts
+        out.append({
+            "opportunity_id": opp.get("id"),
+            "title": attrs.get("title"),
+            "company": company_name,
+            "start": attrs.get("startDate") or attrs.get("beginDate") or attrs.get("start_date"),
+            "end": attrs.get("endDate") or attrs.get("dueDate") or attrs.get("end_date"),
+            "status": attrs.get("status") or attrs.get("state"),
+            "updated": attrs.get("updateDate") or attrs.get("updated_at"),
+        })
+    return out
 
-def fetch_missions(debug=False):
-    attempts_all = []
+# ---------- Fetchers ----------
+def fetch_opportunities():
+    url = f"{BASE_URL}/opportunities"
+    r = requests.get(url, headers=_headers(), timeout=30)
+    if r.status_code == 200:
+        return {"opportunities": _flatten_opportunities(r.json())}
+    return {"error": f"Boond returned {r.status_code}", "body": r.text[:500]}
 
-    # 1) Ping de santé pour vérifier le domaine (pas authentifié)
-    try:
-        u = "https://ui.boondmanager.com/api/application/status"
-        r = requests.get(u, timeout=15)
-        attempts_all.append({"url": u, "status": r.status_code, "ok": r.ok})
-    except Exception as e:
-        attempts_all.append({"url": "https://ui.boondmanager.com/api/application/status", "error": str(e)})
-
-    # 2) Essais authentifiés sur chaque base + endpoint
-    headers_list = make_headers_variants()
-    for base in BASES:
-        for path, params in CANDIDATES:
-            url = f"{base}{path}"
-            data, attempts = try_get(url, headers_list, params=params)
-            attempts_all.extend(attempts)
-            if data is not None:
-                return ({"data": data, "attempts": attempts_all} if debug else data)
-
-    return {"error": "No endpoint matched"} if not debug else {"error": "No endpoint matched", "attempts": attempts_all}
-
+# ---------- Vercel Entrypoint ----------
 def app(environ, start_response):
-    from werkzeug.wrappers import Request, Response
     req = Request(environ)
-
     if req.path.endswith("/api/open_missions"):
         token = req.args.get("token", "")
         if token != GATEKEEPER:
             resp = Response("Unauthorized", HTTPStatus.UNAUTHORIZED, {"Content-Type": "text/plain"})
         else:
             debug = req.args.get("debug") == "1"
-            payload = fetch_missions(debug=debug)
+            if debug:
+                probe = requests.get(f"{BASE_URL}/opportunities", headers=_headers(), timeout=30)
+                payload = {
+                    "attempt": {"url": f"{BASE_URL}/opportunities", "status": probe.status_code},
+                    "preview": (_flatten_opportunities(probe.json())[:5] if probe.ok else None)
+                }
+            else:
+                payload = fetch_opportunities()
             resp = Response(json.dumps(payload), 200, {"Content-Type": "application/json"})
     else:
         resp = Response("Not found", 404, {"Content-Type": "text/plain"})
-
     return resp(environ, start_response)
